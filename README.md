@@ -13,22 +13,38 @@ It can create:
 
 The script **never launches scans automatically**. It only creates and updates scan configurations.
 
+## ✅ New improved flow
+
+The latest version first completes all Nessus-side selections, then asks for the IP file or credentials.
+
+This avoids the old issue where you typed many usernames/passwords first, then later made a mistake in folder/master scan selection and had to start again.
+
 ## Main workflow
 
 ```text
 Choose scan type
    ↓
-Select IP file or credential CSV
+For authenticated mode, choose manual entry or credential CSV
    ↓
 Connect to Nessus API
    ↓
-Load Nessus folders
+Load Nessus folders and scans
    ↓
 Select master scan folder
    ↓
 Select credential-free master scan
    ↓
 Select destination folder
+   ↓
+Review all Nessus selections
+   ↓
+Use y to continue OR b to go back and correct selection
+   ↓
+Select IP file or credential CSV
+   ↓
+For manual authenticated mode, enter username/password per IP
+   ↓
+Final creation confirmation
    ↓
 Copy master scan once per IP
    ↓
@@ -39,6 +55,26 @@ Update target to exactly one IP
 Add SSH credential if authenticated mode is selected
    ↓
 Generate CSV report
+```
+
+## 🔙 Back feature
+
+The script now supports correction before credentials are entered.
+
+You can go back from:
+
+- Master scan selection → back to master folder selection
+- Destination folder selection → back to master scan selection
+- Selection review screen → back to folder/master/destination selection
+
+This means manual credentials are requested **only after** you confirm:
+
+```text
+Master Folder
+Master Scan
+Destination Folder
+Scan Type
+Credential Method
 ```
 
 ## Script file
@@ -116,6 +152,7 @@ chmod 600 credentials.csv
 
 - The selected master scan should be credential-free.
 - The tool checks for existing master credentials before copying.
+- Manual credentials are collected only after folder/master/destination selection is reviewed.
 - Each copied scan receives exactly one target IP.
 - Each authenticated copied scan receives only the matching SSH credential.
 - Existing scan names are skipped by default.
