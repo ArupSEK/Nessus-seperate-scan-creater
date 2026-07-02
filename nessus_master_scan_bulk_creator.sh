@@ -5,16 +5,15 @@
 # Author  : Sleeping Bhudda
 # Purpose :
 #   1. Ask first: Authenticated Scan or Unauthenticated Scan
-#   2. For Authenticated mode, accept secure manual credentials or CSV input
-#   3. Allow Tab completion while selecting input files
-#   4. Retrieve Nessus folders and let the user select the master-scan folder
-#   5. Retrieve existing scans and let the user select an independent master scan
-#   6. Let the user select the destination folder
-#   7. Copy the master once for every individual IP address
-#   8. Rename each copy as: <Destination Folder Name>_<IP Address>
-#   9. Replace the copied target with exactly one IP address
-#  10. For Authenticated mode, add one matching SSH username/password per scan
-#  11. Never launch scans automatically
+#   2. Ask Nessus/folder/master/destination selection BEFORE credential typing
+#   3. Provide Back option while selecting master folder, master scan, and destination
+#   4. For Authenticated mode, accept secure manual credentials or CSV input
+#   5. Allow Tab completion while selecting input files
+#   6. Copy a credential-free master scan once for every individual IP address
+#   7. Rename each copy as: <Destination Folder Name>_<IP Address>
+#   8. Replace each copied scan target with exactly one IP address
+#   9. For Authenticated mode, add one matching SSH username/password per scan
+#  10. Never launch scans automatically
 #===============================================================================
 
 set -uo pipefail
@@ -34,6 +33,7 @@ SKIP_EXISTING_NAMES="${SKIP_EXISTING_NAMES:-yes}"
 ROLLBACK_ON_UPDATE_FAILURE="${ROLLBACK_ON_UPDATE_FAILURE:-yes}"
 VERIFY_FIRST_AUTH_CREDENTIAL="${VERIFY_FIRST_AUTH_CREDENTIAL:-yes}"
 
+# Optional first/second command-line arguments become pre-filled paths.
 DEFAULT_IP_FILE="${1:-}"
 DEFAULT_CREDENTIAL_FILE="${2:-}"
 
@@ -49,6 +49,20 @@ IP_FILE=""
 CREDENTIAL_FILE=""
 SSH_AUTH_METHOD="password"
 REPORT_FILE="master_scan_copies_$(date +%Y%m%d_%H%M%S).csv"
+
+MASTER_FOLDER_ID=""
+MASTER_FOLDER_NAME=""
+SELECTED_MASTER_SCAN_ID=""
+SELECTED_MASTER_SCAN_NAME=""
+SELECTED_MASTER_SCAN_STATUS=""
+SELECTED_MASTER_SCAN_UUID=""
+SELECTED_MASTER_POLICY_ID=""
+SELECTED_MASTER_SCAN_TYPE=""
+SELECTED_FOLDER_ID=""
+SELECTED_FOLDER_NAME=""
+SELECTED_MENU_FOLDER_ID=""
+SELECTED_MENU_FOLDER_NAME=""
+SELECT_ACTION=""
 
 TMP_DIR="$(mktemp -d)"
 CREDENTIALS_JSON="$TMP_DIR/credentials.json"
@@ -96,12 +110,12 @@ print_banner() {
     printf '%s\n' "${MAGENTA}${BOLD}                         Author: Sleeping Bhudda${NC}"
     printf '%s\n' "${CYAN}${BOLD}===============================================================================${NC}"
     printf '\n'
-    printf '%s\n' "${YELLOW}${BOLD}Purpose:${NC}"
-    printf '%s\n' "  1. Choose Authenticated or Unauthenticated scanning"
-    printf '%s\n' "  2. Select a credential-free Master Scan already saved in Nessus"
-    printf '%s\n' "  3. Copy the Master Scan once for every individual IP"
-    printf '%s\n' "  4. Preserve the Master's plugin and assessment configuration"
-    printf '%s\n' "  5. Replace the target and optionally add one SSH credential per copy"
+    printf '%s\n' "${YELLOW}${BOLD}Updated Flow:${NC}"
+    printf '%s\n' "  1. Choose scan type"
+    printf '%s\n' "  2. Connect to Nessus and select folders/master scan FIRST"
+    printf '%s\n' "  3. Use Back option if folder/master/destination selection is wrong"
+    printf '%s\n' "  4. Enter IPs/credentials only after selections are confirmed"
+    printf '%s\n' "  5. Create copied scans only after final confirmation"
     printf '%s\n' "  6. Never launch scans automatically"
     printf '\n%s\n\n' "${CYAN}${BOLD}===============================================================================${NC}"
 }
@@ -115,10 +129,40 @@ require_command() { command -v "$1" >/dev/null 2>&1 || fatal "Required command n
 
 csv_escape() {
     local value="${1:-}"
-    value="${value//"/""}"
+    value="${value//\"/\"\"}"
     printf '"%s"' "$value"
 }
 
+pause_before_credentials() {
+    local answer
+    printf '\n%s\n' "${BLUE}${BOLD}Selection Review Before IP/Credential Entry${NC}"
+    printf '%s\n' "${BLUE}--------------------------------------------------------------${NC}"
+    printf 'Scan type    : %s\n' "$SCAN_MODE_LABEL"
+    printf 'Master folder: %s\n' "$MASTER_FOLDER_NAME"
+    printf 'Master scan  : %s (ID: %s)\n' "$SELECTED_MASTER_SCAN_NAME" "$SELECTED_MASTER_SCAN_ID"
+    printf 'Destination  : %s (ID: %s)\n' "$SELECTED_FOLDER_NAME" "$SELECTED_FOLDER_ID"
+    if [[ "$SCAN_MODE" == "authenticated" ]]; then
+        printf 'Credential   : %s\n' "$AUTH_INPUT_LABEL"
+    fi
+    printf '\n'
+    printf '  y) Continue to IP/credential input\n'
+    printf '  b) Go back and correct folder/master/destination selection\n'
+    printf '  q) Quit without creating scans\n'
+
+    while true; do
+        read -r -p "Choose [y/b/q]: " answer
+        case "$answer" in
+            y|Y) return 0 ;;
+            b|B) return 1 ;;
+            q|Q) warning "Operation cancelled. No scans were created."; exit 0 ;;
+            *) warning "Enter y, b, or q." ;;
+        esac
+    done
+}
+
+#-------------------------------------------------------------------------------
+# INPUT HELPERS
+#-------------------------------------------------------------------------------
 normalise_entered_path() {
     local entered_path="$1"
     entered_path="${entered_path#"${entered_path%%[![:space:]]*}"}"
@@ -130,7 +174,6 @@ normalise_entered_path() {
         entered_path="${entered_path:1:${#entered_path}-2}"
     fi
 
-    # Readline can insert backslashes while completing paths containing spaces.
     entered_path="${entered_path//\\ / }"
     entered_path="${entered_path//\\(/(}"
     entered_path="${entered_path//\\)/)}"
@@ -160,11 +203,13 @@ prompt_for_file() {
 
     while true; do
         [[ -t 0 ]] || fatal "Interactive terminal input is required."
+
         if [[ -n "$default_path" ]]; then
             read -e -r -i "$default_path" -p "$prompt_text" entered_path
         else
             read -e -r -p "$prompt_text" entered_path
         fi
+
         entered_path="$(normalise_entered_path "$entered_path")"
 
         [[ -n "$entered_path" ]] || { warning "File path cannot be empty."; continue; }
@@ -198,6 +243,7 @@ select_scan_mode() {
             *) warning "Enter 1 for Authenticated or 2 for Unauthenticated." ;;
         esac
     done
+
     success "Selected scan type: $SCAN_MODE_LABEL"
 }
 
@@ -208,9 +254,9 @@ select_auth_input_mode() {
     printf '\n%s\n' "${BLUE}${BOLD}Select Credential Input Method${NC}"
     printf '%s\n' "${BLUE}--------------------------------------------------------------${NC}"
     printf '  1) %sManual secure entry%s\n' "${GREEN}${BOLD}" "$NC"
-    printf '     Select an IP file, then type username and hidden password per IP.\n'
+    printf '     First select Nessus folder/master/destination, then enter username/password per IP.\n'
     printf '  2) %sCredential CSV file%s\n' "${CYAN}${BOLD}" "$NC"
-    printf '     Required columns: IP,Username,Password\n'
+    printf '     Required columns: IP,Username,Password. File is requested after Nessus selections.\n'
 
     while true; do
         printf '\n'
@@ -221,21 +267,31 @@ select_auth_input_mode() {
             *) warning "Enter 1 for Manual or 2 for CSV." ;;
         esac
     done
+
     success "Selected credential method: $AUTH_INPUT_LABEL"
 }
 
 prompt_input_files() {
     if [[ "$SCAN_MODE" == "authenticated" && "$AUTH_INPUT_MODE" == "csv" ]]; then
-        prompt_for_file "Select Credential CSV File" "Required header: IP,Username,Password. Press Tab to complete the path." "Enter credential CSV path: " "$DEFAULT_CREDENTIAL_FILE"
+        prompt_for_file \
+            "Select Credential CSV File" \
+            "Required header: IP,Username,Password. Press Tab to complete the path." \
+            "Enter credential CSV path: " \
+            "$DEFAULT_CREDENTIAL_FILE"
         CREDENTIAL_FILE="$PROMPTED_FILE_PATH"
         success "Selected credential CSV: $CREDENTIAL_FILE"
+
         local permissions=""
         permissions=$(stat -c '%a' "$CREDENTIAL_FILE" 2>/dev/null || true)
         if [[ -n "$permissions" && "$permissions" != "600" && "$permissions" != "400" ]]; then
             warning "Credential CSV permissions are $permissions. Recommended: chmod 600 \"$CREDENTIAL_FILE\""
         fi
     else
-        prompt_for_file "Select IP Address File" "The file must contain one individual IP address per line. Press Tab to complete the path." "Enter IP file path: " "$DEFAULT_IP_FILE"
+        prompt_for_file \
+            "Select IP Address File" \
+            "The file must contain one individual IP address per line. Press Tab to complete the path." \
+            "Enter IP file path: " \
+            "$DEFAULT_IP_FILE"
         IP_FILE="$PROMPTED_FILE_PATH"
         success "Selected IP file: $IP_FILE"
     fi
@@ -249,8 +305,10 @@ set_api_header() {
     access_key="${NESSUS_ACCESS_KEY:-${ACCESS_KEY:-}}"
     secret_key="${NESSUS_SECRET_KEY:-${SECRET_KEY:-}}"
 
-    [[ -n "$access_key" && "$access_key" != "your_nessus_access_key" && "$access_key" != "PUT_YOUR_ACCESS_KEY_HERE" ]] || fatal "Add your Nessus access key at the top of the script."
-    [[ -n "$secret_key" && "$secret_key" != "your_nessus_secret_key" && "$secret_key" != "PUT_YOUR_SECRET_KEY_HERE" ]] || fatal "Add your Nessus secret key at the top of the script."
+    [[ -n "$access_key" && "$access_key" != "your_nessus_access_key" && "$access_key" != "PUT_YOUR_ACCESS_KEY_HERE" ]] || \
+        fatal "Add your Nessus access key at the top of the script."
+    [[ -n "$secret_key" && "$secret_key" != "your_nessus_secret_key" && "$secret_key" != "PUT_YOUR_SECRET_KEY_HERE" ]] || \
+        fatal "Add your Nessus secret key at the top of the script."
 
     AUTH_HEADER="X-ApiKeys: accessKey=${access_key}; secretKey=${secret_key}"
 }
@@ -279,6 +337,7 @@ api_call() {
     fi
 
     command+=("${NESSUS_URL}${endpoint}")
+
     status="$("${command[@]}")" || return 1
     printf '%s' "$status"
 }
@@ -294,13 +353,17 @@ api_get() {
 test_connection() {
     local response_file="$TMP_DIR/server_status.json"
     local status
+
     info "Testing Nessus API connection..."
-    status="$(api_call GET '/server/status' "$response_file")" || fatal "Unable to connect to $NESSUS_URL"
+    status="$(api_call GET '/server/status' "$response_file")" || \
+        fatal "Unable to connect to $NESSUS_URL"
+
     if [[ "$status" != "200" ]]; then
         printf '%s\n' "Server response:"
         cat "$response_file" 2>/dev/null || true
         fatal "Nessus connection failed. HTTP $status"
     fi
+
     success "Connected to Nessus successfully."
 }
 
@@ -309,13 +372,15 @@ extract_error_message() {
     python3 - "$response_file" <<'PY'
 import json
 import sys
+
 path = sys.argv[1]
 try:
     raw = open(path, "r", encoding="utf-8").read()
     data = json.loads(raw)
 except Exception:
-    print(raw.strip() if 'raw' in locals() else "Unknown API error")
+    print(raw.strip() if "raw" in locals() else "Unknown API error")
     raise SystemExit(0)
+
 for key in ("error", "message", "detail"):
     if isinstance(data, dict) and data.get(key):
         print(data[key])
@@ -338,6 +403,7 @@ load_targets_from_ip_file() {
         target="${target//$'\r'/}"
         target="${target#"${target%%[![:space:]]*}"}"
         target="${target%"${target##*[![:space:]]}"}"
+
         [[ -n "$target" ]] || continue
         [[ "$target" == \#* ]] && continue
 
@@ -357,16 +423,19 @@ PY
     done < "$IP_FILE"
 
     ((${#TARGETS[@]} > 0)) || fatal "No valid individual IP addresses were found in $IP_FILE"
+
     if ((${#INVALID_TARGETS[@]} > 0)); then
         warning "The following non-IP entries will be skipped:"
         printf '  %s\n' "${INVALID_TARGETS[@]}"
     fi
+
     success "Loaded ${#TARGETS[@]} unique IP address(es)."
 }
 
 load_credentials_from_csv() {
     local targets_file="$TMP_DIR/credential_targets.txt"
     local error_file="$TMP_DIR/credential_csv_error.txt"
+
     info "Validating credential CSV and mapping each credential to one IP..."
 
     if ! python3 - "$CREDENTIAL_FILE" "$CREDENTIALS_JSON" "$targets_file" 2>"$error_file" <<'PY'
@@ -375,29 +444,32 @@ import ipaddress
 import json
 import os
 import sys
+
 csv_path, json_path, targets_path = sys.argv[1:4]
 IP_ALIASES = {"ip", "ip address", "ip_address", "host", "target"}
 USER_ALIASES = {"username", "user", "login"}
 PASS_ALIASES = {"password", "pass"}
 
-def norm(value):
+def normalise(value):
     return str(value or "").strip().lower()
 
 with open(csv_path, "r", encoding="utf-8-sig", newline="") as handle:
     reader = csv.DictReader(handle)
     if not reader.fieldnames:
         raise SystemExit("CSV is empty or has no header row.")
-    fields = {norm(name): name for name in reader.fieldnames if name is not None}
 
-    def find_col(aliases, label):
+    fields = {normalise(name): name for name in reader.fieldnames if name is not None}
+
+    def find_column(aliases, label):
         for alias in aliases:
             if alias in fields:
                 return fields[alias]
         raise SystemExit(f"Missing {label} column. Required header: IP,Username,Password")
 
-    ip_col = find_col(IP_ALIASES, "IP")
-    user_col = find_col(USER_ALIASES, "Username")
-    pass_col = find_col(PASS_ALIASES, "Password")
+    ip_col = find_column(IP_ALIASES, "IP")
+    user_col = find_column(USER_ALIASES, "Username")
+    pass_col = find_column(PASS_ALIASES, "Password")
+
     credentials = {}
     targets = []
     errors = []
@@ -406,15 +478,18 @@ with open(csv_path, "r", encoding="utf-8-sig", newline="") as handle:
         raw_ip = str(row.get(ip_col) or "").strip()
         username = str(row.get(user_col) or "").strip()
         password = str(row.get(pass_col) or "")
+
         if not raw_ip and not username and not password:
             continue
         if raw_ip.startswith("#"):
             continue
+
         try:
             ip = str(ipaddress.ip_address(raw_ip))
         except ValueError:
             errors.append(f"Line {line_number}: invalid individual IP address: {raw_ip!r}")
             continue
+
         if not username:
             errors.append(f"Line {line_number}: username is empty for {ip}")
             continue
@@ -424,6 +499,7 @@ with open(csv_path, "r", encoding="utf-8-sig", newline="") as handle:
         if ip in credentials:
             errors.append(f"Line {line_number}: duplicate IP address: {ip}")
             continue
+
         credentials[ip] = {"username": username, "password": password}
         targets.append(ip)
 
@@ -435,6 +511,7 @@ if not targets:
 with open(json_path, "w", encoding="utf-8") as handle:
     json.dump(credentials, handle, ensure_ascii=False)
 os.chmod(json_path, 0o600)
+
 with open(targets_path, "w", encoding="utf-8", newline="\n") as handle:
     for target in targets:
         handle.write(target + "\n")
@@ -458,14 +535,18 @@ PY
 
 collect_manual_credentials() {
     local target username password confirm_password entry_file
+
     printf '\n%s\n' "${BLUE}${BOLD}Enter SSH Credentials Securely${NC}"
     printf '%s\n' "${BLUE}--------------------------------------------------------------${NC}"
+    printf '%s\n' "Folder, master scan, and destination are already selected."
     printf '%s\n' "Password input is hidden and must be entered twice."
+
     printf '{}\n' > "$CREDENTIALS_JSON"
     chmod 600 "$CREDENTIALS_JSON"
 
     for target in "${TARGETS[@]}"; do
         printf '\n%s\n' "${CYAN}Target: ${target}${NC}"
+
         while true; do
             read -r -p "SSH username: " username
             username="${username#"${username%%[![:space:]]*}"}"
@@ -479,6 +560,7 @@ collect_manual_credentials() {
             printf '\n'
             read -s -r -p "Confirm SSH password: " confirm_password
             printf '\n'
+
             [[ -n "$password" ]] || { warning "Password cannot be empty."; continue; }
             [[ "$password" == "$confirm_password" ]] || { warning "Passwords do not match."; continue; }
             break
@@ -492,20 +574,24 @@ collect_manual_credentials() {
 import json
 import os
 import sys
+
 json_path, entry_path = sys.argv[1:3]
 raw = open(entry_path, "rb").read().split(b"\0")
 if len(raw) < 4:
     raise SystemExit("Unable to read credential input.")
 ip, username, password = (part.decode("utf-8") for part in raw[:3])
+
 try:
     data = json.load(open(json_path, "r", encoding="utf-8"))
 except Exception:
     data = {}
+
 data[ip] = {"username": username, "password": password}
 with open(json_path, "w", encoding="utf-8") as handle:
     json.dump(data, handle, ensure_ascii=False)
 os.chmod(json_path, 0o600)
 PY
+
         rm -f "$entry_file"
         unset password confirm_password username entry_file
         success "Credential stored temporarily for $target."
@@ -524,33 +610,49 @@ prepare_targets_and_credentials() {
 }
 
 #-------------------------------------------------------------------------------
-# NESSUS FOLDERS AND SCANS
+# NESSUS FOLDERS AND MASTER SCANS
 #-------------------------------------------------------------------------------
 load_folders() {
     local response_file="$TMP_DIR/folders.json"
     local parsed_file="$TMP_DIR/folders.tsv"
+
     info "Retrieving folders from Nessus..."
-    api_get '/folders' "$response_file" || { cat "$response_file" 2>/dev/null || true; fatal "Unable to retrieve Nessus folders."; }
+    api_get '/folders' "$response_file" || {
+        cat "$response_file" 2>/dev/null || true
+        fatal "Unable to retrieve Nessus folders."
+    }
 
     python3 - "$response_file" > "$parsed_file" <<'PY'
 import json
 import sys
+
 data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+
 for folder in data.get("folders", []):
     folder_id = folder.get("id", "")
     name = str(folder.get("name", "Unnamed Folder"))
     folder_type = str(folder.get("type", "unknown"))
+
     name = name.replace("\t", " ").replace("\r", " ").replace("\n", " ")
     folder_type = folder_type.replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
     normalized_name = name.strip().lower()
     normalized_type = folder_type.strip().lower()
     selectable = "yes"
     if normalized_name in {"trash", "all scans"} or normalized_type == "trash":
         selectable = "no"
+
     print("\x1f".join(map(str, [folder_id, name, folder_type, selectable])))
 PY
 
     [[ -s "$parsed_file" ]] || fatal "No folders were returned by Nessus."
+
+    FOLDER_IDS=()
+    FOLDER_NAMES=()
+    FOLDER_TYPES=()
+    FOLDER_SELECTABLE=()
+
+    local folder_id folder_name folder_type selectable
     while IFS=$'\x1f' read -r folder_id folder_name folder_type selectable; do
         [[ -n "$folder_id" ]] || continue
         FOLDER_IDS+=("$folder_id")
@@ -558,22 +660,30 @@ PY
         FOLDER_TYPES+=("$folder_type")
         FOLDER_SELECTABLE+=("$selectable")
     done < "$parsed_file"
+
     ((${#FOLDER_IDS[@]} > 0)) || fatal "No usable folders were found."
 }
 
 load_scans() {
     local response_file="$TMP_DIR/scans.json"
     local parsed_file="$TMP_DIR/scans.tsv"
+
     info "Retrieving existing scan configurations from Nessus..."
-    api_get '/scans' "$response_file" || { cat "$response_file" 2>/dev/null || true; fatal "Unable to retrieve Nessus scans."; }
+    api_get '/scans' "$response_file" || {
+        cat "$response_file" 2>/dev/null || true
+        fatal "Unable to retrieve Nessus scans."
+    }
 
     python3 - "$response_file" > "$parsed_file" <<'PY'
 import json
 import sys
+
 data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+
 for scan in data.get("scans", []):
     def safe(value):
         return str(value).replace("\t", " ").replace("\r", " ").replace("\n", " ")
+
     print("\x1f".join(map(safe, [
         scan.get("id", ""),
         scan.get("name", "Unnamed Scan"),
@@ -586,6 +696,16 @@ for scan in data.get("scans", []):
 PY
 
     [[ -s "$parsed_file" ]] || fatal "No scan configurations were returned by Nessus."
+
+    SCAN_IDS=()
+    SCAN_NAMES=()
+    SCAN_FOLDER_IDS=()
+    SCAN_STATUSES=()
+    SCAN_UUIDS=()
+    SCAN_POLICY_IDS=()
+    SCAN_TYPES=()
+    EXISTING_SCAN_NAMES=()
+
     local scan_id scan_name folder_id status uuid policy_id scan_type
     while IFS=$'\x1f' read -r scan_id scan_name folder_id status uuid policy_id scan_type; do
         [[ -n "$scan_id" ]] || continue
@@ -598,23 +718,47 @@ PY
         SCAN_TYPES+=("$scan_type")
         EXISTING_SCAN_NAMES["$scan_name"]=1
     done < "$parsed_file"
+
     ((${#SCAN_IDS[@]} > 0)) || fatal "No usable scan configurations were found."
 }
 
 select_folder_from_menu() {
     local purpose="$1"
+    local allow_back="${2:-no}"
     local choice index marker
+
     printf '\n%s\n' "${BLUE}${BOLD}${purpose}${NC}"
     printf '%s\n' "${BLUE}--------------------------------------------------------------${NC}"
+
     for index in "${!FOLDER_IDS[@]}"; do
         marker=""
         [[ "${FOLDER_SELECTABLE[$index]}" != "yes" ]] && marker=" [not selectable]"
-        printf ' %3d) %-38s [ID: %s | Type: %s]%s\n' "$((index + 1))" "${FOLDER_NAMES[$index]}" "${FOLDER_IDS[$index]}" "${FOLDER_TYPES[$index]}" "$marker"
+        printf ' %3d) %-38s [ID: %s | Type: %s]%s\n' \
+            "$((index + 1))" \
+            "${FOLDER_NAMES[$index]}" \
+            "${FOLDER_IDS[$index]}" \
+            "${FOLDER_TYPES[$index]}" \
+            "$marker"
     done
+
+    printf '\n'
+    [[ "$allow_back" == "yes" ]] && printf '   b) Back to previous step\n'
+    printf '   q) Quit without creating scans\n'
 
     while true; do
         printf '\n'
         read -r -p "Select folder number: " choice
+
+        case "$choice" in
+            q|Q) warning "Operation cancelled. No scans were created."; exit 0 ;;
+            b|B)
+                if [[ "$allow_back" == "yes" ]]; then
+                    SELECT_ACTION="back"
+                    return 1
+                fi
+                ;;
+        esac
+
         if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= ${#FOLDER_IDS[@]})); then
             index=$((choice - 1))
             if [[ "${FOLDER_SELECTABLE[$index]}" != "yes" ]]; then
@@ -623,94 +767,184 @@ select_folder_from_menu() {
             fi
             SELECTED_MENU_FOLDER_ID="${FOLDER_IDS[$index]}"
             SELECTED_MENU_FOLDER_NAME="${FOLDER_NAMES[$index]}"
+            SELECT_ACTION="selected"
             return 0
         fi
-        warning "Enter a number from 1 to ${#FOLDER_IDS[@]}."
+
+        warning "Enter a number from 1 to ${#FOLDER_IDS[@]}, or b/q where available."
     done
 }
 
-select_master_scan() {
-    local choice display_index array_index folder_scan_count
-    local -a candidate_indexes
+select_master_folder_step() {
     while true; do
-        select_folder_from_menu "Select the Folder Containing the Master Scan"
+        select_folder_from_menu "Select the Folder Containing the Master Scan" "no"
         MASTER_FOLDER_ID="$SELECTED_MENU_FOLDER_ID"
         MASTER_FOLDER_NAME="$SELECTED_MENU_FOLDER_NAME"
-        candidate_indexes=()
+
+        local folder_scan_count=0
+        local array_index
         for array_index in "${!SCAN_IDS[@]}"; do
-            [[ "${SCAN_FOLDER_IDS[$array_index]}" == "$MASTER_FOLDER_ID" ]] && candidate_indexes+=("$array_index")
-        done
-        folder_scan_count=${#candidate_indexes[@]}
-        ((folder_scan_count > 0)) || { warning "No scan configurations were found in '$MASTER_FOLDER_NAME'. Select another folder."; continue; }
-
-        printf '\n%s\n' "${BLUE}${BOLD}Select Master Scan from: ${MASTER_FOLDER_NAME}${NC}"
-        printf '%s\n' "${BLUE}--------------------------------------------------------------${NC}"
-        for display_index in "${!candidate_indexes[@]}"; do
-            array_index="${candidate_indexes[$display_index]}"
-            printf ' %3d) %-48s [ID: %s | Status: %s]\n' "$((display_index + 1))" "${SCAN_NAMES[$array_index]}" "${SCAN_IDS[$array_index]}" "${SCAN_STATUSES[$array_index]}"
+            [[ "${SCAN_FOLDER_IDS[$array_index]}" == "$MASTER_FOLDER_ID" ]] && ((folder_scan_count += 1))
         done
 
-        while true; do
-            printf '\n'
-            read -r -p "Select Master Scan number: " choice
-            if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= folder_scan_count)); then
-                array_index="${candidate_indexes[$((choice - 1))]}"
-                SELECTED_MASTER_SCAN_ID="${SCAN_IDS[$array_index]}"
-                SELECTED_MASTER_SCAN_NAME="${SCAN_NAMES[$array_index]}"
-                SELECTED_MASTER_SCAN_STATUS="${SCAN_STATUSES[$array_index]}"
-                SELECTED_MASTER_SCAN_UUID="${SCAN_UUIDS[$array_index]}"
-                SELECTED_MASTER_POLICY_ID="${SCAN_POLICY_IDS[$array_index]}"
-                SELECTED_MASTER_SCAN_TYPE="${SCAN_TYPES[$array_index]}"
-                break 2
-            fi
-            warning "Enter a number from 1 to $folder_scan_count."
-        done
+        if ((folder_scan_count == 0)); then
+            warning "No scan configurations were found in '$MASTER_FOLDER_NAME'. Select another folder."
+            continue
+        fi
+
+        return 0
+    done
+}
+
+select_master_scan_step() {
+    local choice display_index array_index folder_scan_count
+    local -a candidate_indexes
+
+    candidate_indexes=()
+    for array_index in "${!SCAN_IDS[@]}"; do
+        [[ "${SCAN_FOLDER_IDS[$array_index]}" == "$MASTER_FOLDER_ID" ]] && candidate_indexes+=("$array_index")
+    done
+
+    folder_scan_count=${#candidate_indexes[@]}
+    ((folder_scan_count > 0)) || return 1
+
+    printf '\n%s\n' "${BLUE}${BOLD}Select Master Scan from: ${MASTER_FOLDER_NAME}${NC}"
+    printf '%s\n' "${BLUE}--------------------------------------------------------------${NC}"
+
+    for display_index in "${!candidate_indexes[@]}"; do
+        array_index="${candidate_indexes[$display_index]}"
+        printf ' %3d) %-48s [ID: %s | Status: %s]\n' \
+            "$((display_index + 1))" \
+            "${SCAN_NAMES[$array_index]}" \
+            "${SCAN_IDS[$array_index]}" \
+            "${SCAN_STATUSES[$array_index]}"
+    done
+
+    printf '\n   b) Back to master folder selection\n'
+    printf '   q) Quit without creating scans\n'
+
+    while true; do
+        printf '\n'
+        read -r -p "Select Master Scan number: " choice
+
+        case "$choice" in
+            b|B) SELECT_ACTION="back"; return 1 ;;
+            q|Q) warning "Operation cancelled. No scans were created."; exit 0 ;;
+        esac
+
+        if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice >= 1 && choice <= folder_scan_count)); then
+            array_index="${candidate_indexes[$((choice - 1))]}"
+            SELECTED_MASTER_SCAN_ID="${SCAN_IDS[$array_index]}"
+            SELECTED_MASTER_SCAN_NAME="${SCAN_NAMES[$array_index]}"
+            SELECTED_MASTER_SCAN_STATUS="${SCAN_STATUSES[$array_index]}"
+            SELECTED_MASTER_SCAN_UUID="${SCAN_UUIDS[$array_index]}"
+            SELECTED_MASTER_POLICY_ID="${SCAN_POLICY_IDS[$array_index]}"
+            SELECTED_MASTER_SCAN_TYPE="${SCAN_TYPES[$array_index]}"
+            SELECT_ACTION="selected"
+            break
+        fi
+
+        warning "Enter a number from 1 to $folder_scan_count, or b/q."
     done
 
     success "Selected Master Scan: $SELECTED_MASTER_SCAN_NAME (ID: $SELECTED_MASTER_SCAN_ID)"
+
     if [[ -n "$SELECTED_MASTER_POLICY_ID" && "$SELECTED_MASTER_POLICY_ID" != "0" && "$SELECTED_MASTER_POLICY_ID" != "null" ]]; then
         warning "This scan reports policy_id=$SELECTED_MASTER_POLICY_ID and may be policy-based."
         warning "For independently editable copies, use a Master Scan created directly from Advanced Scan."
         local answer
-        read -r -p "Continue with this Master Scan anyway? [y/N]: " answer
-        [[ "$answer" =~ ^[Yy]$ ]] || fatal "Select an independent Advanced Scan master."
+        read -r -p "Continue with this Master Scan anyway? [y/N/b]: " answer
+        case "$answer" in
+            y|Y) ;;
+            b|B) SELECT_ACTION="back"; return 1 ;;
+            *) fatal "Select an independent Advanced Scan master." ;;
+        esac
     fi
+
     if [[ -n "$SELECTED_MASTER_SCAN_STATUS" && "$SELECTED_MASTER_SCAN_STATUS" != "empty" && "$SELECTED_MASTER_SCAN_STATUS" != "never" ]]; then
         warning "Master status is '$SELECTED_MASTER_SCAN_STATUS'. A master should normally never be launched."
     fi
+
+    return 0
 }
 
-select_destination_folder() {
-    select_folder_from_menu "Select Destination Folder for the New Scan Copies"
+select_destination_folder_step() {
+    if ! select_folder_from_menu "Select Destination Folder for the New Scan Copies" "yes"; then
+        return 1
+    fi
+
     SELECTED_FOLDER_ID="$SELECTED_MENU_FOLDER_ID"
     SELECTED_FOLDER_NAME="$SELECTED_MENU_FOLDER_NAME"
     success "Selected destination folder: $SELECTED_FOLDER_NAME (ID: $SELECTED_FOLDER_ID)"
+
     if [[ "$SELECTED_FOLDER_ID" == "$MASTER_FOLDER_ID" ]]; then
         warning "The Master Scan folder and destination folder are the same."
         local answer
-        read -r -p "Continue using the same folder? [y/N]: " answer
-        [[ "$answer" =~ ^[Yy]$ ]] || fatal "Select a different destination folder."
+        read -r -p "Continue using the same folder? [y/N/b]: " answer
+        case "$answer" in
+            y|Y) return 0 ;;
+            b|B) SELECT_ACTION="back"; return 1 ;;
+            *) warning "Select a different destination folder."; SELECT_ACTION="retry"; return 1 ;;
+        esac
     fi
+
+    SELECT_ACTION="selected"
+    return 0
+}
+
+selection_wizard() {
+    local step=1
+
+    while true; do
+        case "$step" in
+            1)
+                select_master_folder_step
+                step=2
+                ;;
+            2)
+                if select_master_scan_step; then
+                    step=3
+                else
+                    step=1
+                fi
+                ;;
+            3)
+                if select_destination_folder_step; then
+                    return 0
+                else
+                    if [[ "${SELECT_ACTION:-}" == "back" ]]; then
+                        step=2
+                    else
+                        step=3
+                    fi
+                fi
+                ;;
+        esac
+    done
 }
 
 resolve_master_uuid() {
     local editor_file="$TMP_DIR/master_editor.json"
     local results_file="$TMP_DIR/master_results.json"
     local editor_uuid=""
+
     info "Retrieving the Master Scan editor UUID required for updates..."
 
     if api_get "/editor/scan/${SELECTED_MASTER_SCAN_ID}" "$editor_file"; then
         editor_uuid="$(python3 - "$editor_file" <<'PY'
 import json
 import sys
+
 data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
 candidates = []
+
 if isinstance(data, dict):
     candidates.extend([data.get("uuid"), data.get("template_uuid")])
     for key in ("scan", "policy", "template"):
         value = data.get(key)
         if isinstance(value, dict):
             candidates.extend([value.get("uuid"), value.get("template_uuid")])
+
 for value in candidates:
     if value:
         print(value)
@@ -726,10 +960,12 @@ PY
     fi
 
     warning "The editor endpoint did not expose a UUID; trying scan details and scan-list fallbacks."
+
     if api_get "/scans/${SELECTED_MASTER_SCAN_ID}" "$results_file"; then
         SELECTED_MASTER_SCAN_UUID="$(python3 - "$results_file" <<'PY'
 import json
 import sys
+
 data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
 for obj in (data.get("scan"), data.get("info"), data):
     if isinstance(obj, dict) and obj.get("uuid"):
@@ -738,22 +974,30 @@ for obj in (data.get("scan"), data.get("info"), data):
 PY
 )"
     fi
-    [[ -n "$SELECTED_MASTER_SCAN_UUID" ]] || fatal "Unable to determine the Master Scan UUID required for PUT /scans/{id}."
+
+    [[ -n "$SELECTED_MASTER_SCAN_UUID" ]] || \
+        fatal "Unable to determine the Master Scan UUID required for PUT /scans/{id}."
+
     warning "Using a fallback scan UUID because the editor UUID was unavailable."
 }
 
 check_master_credentials() {
     local editor_file="$TMP_DIR/master_credential_check.json"
     local detected="unknown"
+
     info "Checking whether the selected Master Scan already contains credentials..."
+
     if ! api_get "/editor/scan/${SELECTED_MASTER_SCAN_ID}" "$editor_file"; then
         warning "Could not inspect Master Scan credentials. Confirm manually that the master contains no credentials."
         return 0
     fi
+
     detected="$(python3 - "$editor_file" <<'PY'
 import json
 import sys
+
 data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+
 def has_nonempty(value):
     if value is None or value == "" or value == [] or value == {}:
         return False
@@ -762,6 +1006,7 @@ def has_nonempty(value):
     if isinstance(value, list):
         return any(has_nonempty(v) for v in value)
     return True
+
 def walk(value):
     if isinstance(value, dict):
         yield value
@@ -770,6 +1015,7 @@ def walk(value):
     elif isinstance(value, list):
         for child in value:
             yield from walk(child)
+
 for obj in walk(data):
     credentials = obj.get("credentials")
     if isinstance(credentials, dict):
@@ -777,23 +1023,33 @@ for obj in walk(data):
         if isinstance(current, dict) and has_nonempty(current):
             print("yes")
             raise SystemExit(0)
+
 print("no")
 PY
 )"
-    [[ "$detected" == "yes" ]] && fatal "The selected Master Scan contains existing credentials. Remove them before copying to avoid account lockout."
+
+    if [[ "$detected" == "yes" ]]; then
+        fatal "The selected Master Scan contains existing credentials. Remove them before copying to avoid account lockout."
+    fi
+
     success "No existing credentials were detected in the Master Scan."
 }
 
 detect_ssh_password_auth_method() {
     local response_file="$TMP_DIR/credential_types.json"
     local detected=""
+
     [[ "$SCAN_MODE" == "authenticated" ]] || return 0
+
     info "Determining the exact SSH password authentication method ID..."
+
     if api_get '/credentials/types' "$response_file"; then
         detected="$(python3 - "$response_file" <<'PY'
 import json
 import sys
+
 data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+
 def walk(value):
     if isinstance(value, dict):
         yield value
@@ -802,6 +1058,7 @@ def walk(value):
     elif isinstance(value, list):
         for child in value:
             yield from walk(child)
+
 def find_password_option(value):
     for obj in walk(value):
         if str(obj.get("id") or "").lower() != "auth_method":
@@ -817,6 +1074,7 @@ def find_password_option(value):
             if option_id.lower() == "password" or option_name.lower() == "password":
                 return option_id or "password"
     return ""
+
 for obj in walk(data):
     type_id = str(obj.get("id") or obj.get("name") or "").lower()
     if type_id != "ssh":
@@ -825,10 +1083,12 @@ for obj in walk(data):
     if result:
         print(result)
         raise SystemExit(0)
+
 raise SystemExit(1)
 PY
 )" || true
     fi
+
     if [[ -n "$detected" ]]; then
         SSH_AUTH_METHOD="$detected"
         success "SSH auth_method: $SSH_AUTH_METHOD"
@@ -843,6 +1103,7 @@ PY
 #-------------------------------------------------------------------------------
 confirm_creation() {
     local answer
+
     printf '\n%s\n' "${BLUE}${BOLD}Creation Summary${NC}"
     printf '%s\n' "${BLUE}--------------------------------------------------------------${NC}"
     printf 'Scan type       : %s\n' "$SCAN_MODE_LABEL"
@@ -853,16 +1114,21 @@ confirm_creation() {
     printf 'New scan names  : %s_<IP address>\n' "$SELECTED_FOLDER_NAME"
     printf 'Automatic launch: Disabled\n'
     printf 'Existing names  : %s\n' "$SKIP_EXISTING_NAMES"
+
     if [[ "$SCAN_MODE" == "authenticated" ]]; then
         printf 'Credential input: %s\n' "$AUTH_INPUT_LABEL"
         printf 'Credential rule : Exactly one SSH credential per copied scan\n'
     else
         printf 'Credentials     : None\n'
     fi
+
     printf '\n%s\n' "${YELLOW}${BOLD}IMPORTANT:${NC} The selected Master Scan must remain credential-free."
     printf '\n'
     read -r -p "Create these Master Scan copies? [y/N]: " answer
-    [[ "$answer" =~ ^[Yy]$ ]] || { warning "Operation cancelled. No scans were created."; exit 0; }
+    [[ "$answer" =~ ^[Yy]$ ]] || {
+        warning "Operation cancelled. No scans were created."
+        exit 0
+    }
 }
 
 #-------------------------------------------------------------------------------
@@ -873,7 +1139,9 @@ parse_copy_response() {
     python3 - "$response_file" <<'PY'
 import json
 import sys
+
 data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+
 candidates = []
 if isinstance(data, dict):
     for key in ("scan", "copy", "configuration"):
@@ -881,6 +1149,7 @@ if isinstance(data, dict):
         if isinstance(value, dict):
             candidates.append(value)
     candidates.append(data)
+
 scan_id = ""
 uuid = ""
 for obj in candidates:
@@ -888,6 +1157,7 @@ for obj in candidates:
         scan_id = str(obj.get("id"))
     if not uuid and obj.get("uuid"):
         uuid = str(obj.get("uuid"))
+
 print(f"{scan_id}\x1f{uuid}")
 PY
 }
@@ -896,7 +1166,9 @@ rollback_copy() {
     local scan_id="$1"
     local response_file="$TMP_DIR/delete_${scan_id}.json"
     local status
+
     [[ "$ROLLBACK_ON_UPDATE_FAILURE" == "yes" ]] || return 0
+
     status="$(api_call DELETE "/scans/${scan_id}" "$response_file")" || true
     if [[ "$status" == "200" || "$status" == "202" || "$status" == "204" ]]; then
         warning "Removed incomplete copied scan ID $scan_id."
@@ -910,13 +1182,17 @@ verify_auth_credential_best_effort() {
     local username="$2"
     local editor_file="$TMP_DIR/verify_auth_${scan_id}.json"
     local verified="no"
+
     [[ "$VERIFY_FIRST_AUTH_CREDENTIAL" == "yes" ]] || return 0
+
     if api_get "/editor/scan/${scan_id}" "$editor_file"; then
         verified="$(python3 - "$editor_file" "$username" <<'PY'
 import json
 import sys
+
 data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
 username = sys.argv[2]
+
 def walk(value):
     if isinstance(value, dict):
         yield value
@@ -925,6 +1201,7 @@ def walk(value):
     elif isinstance(value, list):
         for child in value:
             yield from walk(child)
+
 for obj in walk(data):
     credentials = obj.get("credentials")
     if isinstance(credentials, dict):
@@ -934,14 +1211,17 @@ for obj in walk(data):
             if isinstance(host, dict) and host.get("SSH"):
                 print("yes")
                 raise SystemExit(0)
+
 for obj in walk(data):
     if str(obj.get("username") or "") == username:
         print("yes")
         raise SystemExit(0)
+
 print("no")
 PY
 )"
     fi
+
     if [[ "$verified" == "yes" ]]; then
         success "Best-effort check found the SSH credential on the first copied scan."
     else
@@ -960,7 +1240,9 @@ create_master_copies() {
     created=0
     failed=0
     skipped=0
+
     printf '%s\n' '"IP","Scan Name","Scan ID","Scan Type","Credential Method","Master Scan","Destination Folder","Status"' > "$REPORT_FILE"
+
     printf '\n%s\n' "${CYAN}${BOLD}[*] Copying and updating Master Scan configurations...${NC}"
 
     local index=0
@@ -968,46 +1250,77 @@ create_master_copies() {
         ((index += 1))
         safe_target="$(printf '%s' "$target" | tr '/: ' '___')"
         scan_name="${SELECTED_FOLDER_NAME}_${safe_target}"
+
         printf '\n%s\n' "${CYAN}[${index}/${total}] Processing: ${scan_name}${NC}"
         printf '    Target: %s\n' "$target"
 
         if [[ "$SKIP_EXISTING_NAMES" == "yes" && -n "${EXISTING_SCAN_NAMES[$scan_name]+x}" ]]; then
             warning "A scan named '$scan_name' already exists. Skipping."
-            printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$(csv_escape "$target")" "$(csv_escape "$scan_name")" '""' "$(csv_escape "$SCAN_MODE_LABEL")" "$(csv_escape "${AUTH_INPUT_LABEL:-N/A}")" "$(csv_escape "$SELECTED_MASTER_SCAN_NAME")" "$(csv_escape "$SELECTED_FOLDER_NAME")" '"Skipped: name already exists"' >> "$REPORT_FILE"
+            printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
+                "$(csv_escape "$target")" \
+                "$(csv_escape "$scan_name")" \
+                '""' \
+                "$(csv_escape "$SCAN_MODE_LABEL")" \
+                "$(csv_escape "${AUTH_INPUT_LABEL:-N/A}")" \
+                "$(csv_escape "$SELECTED_MASTER_SCAN_NAME")" \
+                "$(csv_escape "$SELECTED_FOLDER_NAME")" \
+                '"Skipped: name already exists"' >> "$REPORT_FILE"
             ((skipped += 1))
             continue
         fi
 
         copy_payload="$TMP_DIR/copy_${index}.json"
         copy_response="$TMP_DIR/copy_response_${index}.json"
+
         python3 - "$SELECTED_FOLDER_ID" "$scan_name" "$copy_payload" <<'PY'
 import json
 import os
 import sys
+
 folder_id, name, path = sys.argv[1:4]
 with open(path, "w", encoding="utf-8") as handle:
     json.dump({"folder_id": int(folder_id), "name": name}, handle)
 os.chmod(path, 0o600)
 PY
+
         copy_status="$(api_call POST "/scans/${SELECTED_MASTER_SCAN_ID}/copy" "$copy_response" "$copy_payload")" || copy_status=""
+
         if [[ "$copy_status" != "200" && "$copy_status" != "201" ]]; then
             update_error="$(extract_error_message "$copy_response")"
             printf '%s\n' "${RED}    [ERROR] Master copy failed. HTTP ${copy_status:-unknown}: ${update_error}${NC}"
-            printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$(csv_escape "$target")" "$(csv_escape "$scan_name")" '""' "$(csv_escape "$SCAN_MODE_LABEL")" "$(csv_escape "${AUTH_INPUT_LABEL:-N/A}")" "$(csv_escape "$SELECTED_MASTER_SCAN_NAME")" "$(csv_escape "$SELECTED_FOLDER_NAME")" "$(csv_escape "Copy failed HTTP ${copy_status:-unknown}")" >> "$REPORT_FILE"
+            printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
+                "$(csv_escape "$target")" \
+                "$(csv_escape "$scan_name")" \
+                '""' \
+                "$(csv_escape "$SCAN_MODE_LABEL")" \
+                "$(csv_escape "${AUTH_INPUT_LABEL:-N/A}")" \
+                "$(csv_escape "$SELECTED_MASTER_SCAN_NAME")" \
+                "$(csv_escape "$SELECTED_FOLDER_NAME")" \
+                "$(csv_escape "Copy failed HTTP ${copy_status:-unknown}")" >> "$REPORT_FILE"
             ((failed += 1))
             continue
         fi
 
         IFS=$'\x1f' read -r copied_id copied_uuid < <(parse_copy_response "$copy_response")
+
         if [[ -z "$copied_id" ]]; then
             printf '%s\n' "${RED}    [ERROR] Copy succeeded but the new Scan ID could not be parsed.${NC}"
-            printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$(csv_escape "$target")" "$(csv_escape "$scan_name")" '""' "$(csv_escape "$SCAN_MODE_LABEL")" "$(csv_escape "${AUTH_INPUT_LABEL:-N/A}")" "$(csv_escape "$SELECTED_MASTER_SCAN_NAME")" "$(csv_escape "$SELECTED_FOLDER_NAME")" '"Copy response missing Scan ID"' >> "$REPORT_FILE"
+            printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
+                "$(csv_escape "$target")" \
+                "$(csv_escape "$scan_name")" \
+                '""' \
+                "$(csv_escape "$SCAN_MODE_LABEL")" \
+                "$(csv_escape "${AUTH_INPUT_LABEL:-N/A}")" \
+                "$(csv_escape "$SELECTED_MASTER_SCAN_NAME")" \
+                "$(csv_escape "$SELECTED_FOLDER_NAME")" \
+                '"Copy response missing Scan ID"' >> "$REPORT_FILE"
             ((failed += 1))
             continue
         fi
 
         copied_uuid="$SELECTED_MASTER_SCAN_UUID"
         printf '%s\n' "${GREEN}    [+] Master copied. New Scan ID: ${copied_id}${NC}"
+
         update_payload="$TMP_DIR/update_${copied_id}.json"
         update_response="$TMP_DIR/update_response_${copied_id}.json"
 
@@ -1015,6 +1328,7 @@ PY
             username="$(python3 - "$CREDENTIALS_JSON" "$target" <<'PY'
 import json
 import sys
+
 data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
 credential = data.get(sys.argv[2]) or {}
 print(credential.get("username", ""))
@@ -1026,17 +1340,39 @@ PY
             credential_method="N/A"
         fi
 
-        python3 - "$copied_uuid" "$scan_name" "$target" "$SELECTED_FOLDER_ID" "$SCAN_MODE" "$CREDENTIALS_JSON" "$SSH_AUTH_METHOD" "$SELECTED_MASTER_SCAN_NAME" "$update_payload" <<'PY'
+        python3 - \
+            "$copied_uuid" \
+            "$scan_name" \
+            "$target" \
+            "$SELECTED_FOLDER_ID" \
+            "$SCAN_MODE" \
+            "$CREDENTIALS_JSON" \
+            "$SSH_AUTH_METHOD" \
+            "$SELECTED_MASTER_SCAN_NAME" \
+            "$update_payload" <<'PY'
 import json
 import os
 import sys
-scan_uuid, scan_name, target, folder_id, scan_mode, credentials_path, auth_method, master_name, output_path = sys.argv[1:10]
+
+(
+    scan_uuid,
+    scan_name,
+    target,
+    folder_id,
+    scan_mode,
+    credentials_path,
+    auth_method,
+    master_name,
+    output_path,
+) = sys.argv[1:10]
+
 authenticated = scan_mode == "authenticated"
 description = (
     f"Copied from Master Scan '{master_name}'. Authenticated SSH scan for {target}; one credential is mapped only to this IP."
     if authenticated
     else f"Copied from Master Scan '{master_name}'. Unauthenticated scan for {target}."
 )
+
 payload = {
     "uuid": scan_uuid,
     "settings": {
@@ -1047,11 +1383,13 @@ payload = {
         "enabled": False,
     },
 }
+
 if authenticated:
     credentials = json.load(open(credentials_path, "r", encoding="utf-8"))
     credential = credentials.get(target)
     if not credential:
         raise SystemExit(f"No credential mapping found for {target}")
+
     payload["credentials"] = {
         "add": {
             "Host": {
@@ -1065,10 +1403,12 @@ if authenticated:
             }
         }
     }
+
 with open(output_path, "w", encoding="utf-8") as handle:
     json.dump(payload, handle, ensure_ascii=False)
 os.chmod(output_path, 0o600)
 PY
+
         if [[ $? -ne 0 ]]; then
             printf '%s\n' "${RED}    [ERROR] Could not build the update payload.${NC}"
             rollback_copy "$copied_id"
@@ -1077,6 +1417,7 @@ PY
         fi
 
         update_status="$(api_call PUT "/scans/${copied_id}" "$update_response" "$update_payload")" || update_status=""
+
         if [[ "$update_status" == "200" || "$update_status" == "201" ]]; then
             printf '%s\n' "${GREEN}    [+] Target updated to: ${target}${NC}"
             if [[ "$SCAN_MODE" == "authenticated" ]]; then
@@ -1086,16 +1427,34 @@ PY
                     verified_once="yes"
                 fi
             fi
+
             EXISTING_SCAN_NAMES["$scan_name"]=1
-            printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$(csv_escape "$target")" "$(csv_escape "$scan_name")" "$(csv_escape "$copied_id")" "$(csv_escape "$SCAN_MODE_LABEL")" "$(csv_escape "$credential_method")" "$(csv_escape "$SELECTED_MASTER_SCAN_NAME")" "$(csv_escape "$SELECTED_FOLDER_NAME")" '"Created and updated"' >> "$REPORT_FILE"
+            printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
+                "$(csv_escape "$target")" \
+                "$(csv_escape "$scan_name")" \
+                "$(csv_escape "$copied_id")" \
+                "$(csv_escape "$SCAN_MODE_LABEL")" \
+                "$(csv_escape "$credential_method")" \
+                "$(csv_escape "$SELECTED_MASTER_SCAN_NAME")" \
+                "$(csv_escape "$SELECTED_FOLDER_NAME")" \
+                '"Created and updated"' >> "$REPORT_FILE"
             ((created += 1))
         else
             update_error="$(extract_error_message "$update_response")"
             printf '%s\n' "${RED}    [ERROR] Copied scan update failed. HTTP ${update_status:-unknown}: ${update_error}${NC}"
             rollback_copy "$copied_id"
-            printf '%s,%s,%s,%s,%s,%s,%s,%s\n' "$(csv_escape "$target")" "$(csv_escape "$scan_name")" "$(csv_escape "$copied_id")" "$(csv_escape "$SCAN_MODE_LABEL")" "$(csv_escape "$credential_method")" "$(csv_escape "$SELECTED_MASTER_SCAN_NAME")" "$(csv_escape "$SELECTED_FOLDER_NAME")" "$(csv_escape "Update failed HTTP ${update_status:-unknown}")" >> "$REPORT_FILE"
+            printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
+                "$(csv_escape "$target")" \
+                "$(csv_escape "$scan_name")" \
+                "$(csv_escape "$copied_id")" \
+                "$(csv_escape "$SCAN_MODE_LABEL")" \
+                "$(csv_escape "$credential_method")" \
+                "$(csv_escape "$SELECTED_MASTER_SCAN_NAME")" \
+                "$(csv_escape "$SELECTED_FOLDER_NAME")" \
+                "$(csv_escape "Update failed HTTP ${update_status:-unknown}")" >> "$REPORT_FILE"
             ((failed += 1))
         fi
+
         sleep 1
     done
 
@@ -1107,6 +1466,7 @@ PY
     printf 'Failed              : %s%s%s\n' "$RED" "$failed" "$NC"
     printf 'Report              : %s\n' "$REPORT_FILE"
     printf 'Automatic launch    : Disabled\n'
+
     if [[ "$SCAN_MODE" == "authenticated" && "$created" -gt 0 ]]; then
         printf '\n%s\n' "${YELLOW}${BOLD}Before launching:${NC} Open the first created scan and confirm Credentials > Host > SSH."
     fi
@@ -1117,24 +1477,31 @@ PY
 #-------------------------------------------------------------------------------
 main() {
     print_banner
+
     require_command curl
     require_command python3
     require_command stat
 
     select_scan_mode
     select_auth_input_mode
-    prompt_input_files
 
     set_api_header
     test_connection
-    prepare_targets_and_credentials
     load_folders
     load_scans
-    select_master_scan
-    select_destination_folder
-    resolve_master_uuid
-    check_master_credentials
-    detect_ssh_password_auth_method
+
+    while true; do
+        selection_wizard
+        resolve_master_uuid
+        check_master_credentials
+        detect_ssh_password_auth_method
+        if pause_before_credentials; then
+            break
+        fi
+    done
+
+    prompt_input_files
+    prepare_targets_and_credentials
     confirm_creation
     create_master_copies
 }
